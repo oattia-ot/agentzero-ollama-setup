@@ -1,0 +1,147 @@
+# Docker Compose for Agent Zero + Ollama — CPU profile tuned for:
+#   64GB RAM / 16 cores, running under WSL2 (Docker Desktop or docker-ce in WSL)
+#
+# Fixed & tuned version — see FIXES.md for what was wrong originally,
+# and the "WSL2 hardware notes" section below before you start.
+#
+# Usage:
+#   cp .env.example .env      # adjust if your box differs from 64GB/16 cores
+#   docker compose up -d
+#   docker compose exec ollama ollama pull gemma4:e4b
+#
+# After first start, configure in Agent Zero UI (Settings -> Configure Models):
+#   Provider: Ollama
+#   API Base URL: http://ollama:11434      <-- service name, NOT host.docker.internal
+#   (agent-zero and ollama are containers on the SAME docker compose network,
+#    so they reach each other by service name. host.docker.internal points at
+#    the host machine's gateway instead, and on plain Linux/WSL2 it does not
+#    resolve at all unless added via extra_hosts — this was the original bug.)
+#
+# --- WSL2 hardware notes (read this once) ---------------------------------
+# WSL2's own VM defaults to 50% of host RAM and ALL logical processors, which
+# on a 64GB/16-core machine means the WSL2 VM itself may cap out around 32GB
+# regardless of what you set below in mem_limit/cpus. To actually give
+# Docker access to more (e.g. 48-56GB / 16 cores), create or edit
+# C:\Users\<you>\.wslconfig on the Windows side:
+#
+#   [wsl2]
+#   memory=56GB
+#   processors=16
+#   swap=8GB
+#
+# then `wsl --shutdown` from PowerShell and restart Docker Desktop/WSL2.
+# Without this, the container-level limits below are capped by the WSL2 VM
+# ceiling, not by what you write in docker-compose.yml or .env.
+# ----------------------------------------------------------------------------
+
+services:
+  ollama:
+    image: ollama/ollama:latest
+    container_name: ollama
+    ports:
+      - "${OLLAMA_PORT:-11434}:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    environment:
+      - OLLAMA_KEEP_ALIVE=${OLLAMA_KEEP_ALIVE:-24h}
+      - OLLAMA_CONTEXT_LENGTH=${OLLAMA_CONTEXT_LENGTH:-16384}
+      # CPU inference tuning — with 16 cores available, let Ollama use most
+      # of them for a single request, while still allowing a couple of
+      # requests/models to be handled concurrently.
+      - OLLAMA_NUM_THREAD=${OLLAMA_NUM_THREAD:-14}
+      - OLLAMA_NUM_PARALLEL=${OLLAMA_NUM_PARALLEL:-2}
+      - OLLAMA_MAX_LOADED_MODELS=${OLLAMA_MAX_LOADED_MODELS:-2}
+      - OLLAMA_MAX_QUEUE=${OLLAMA_MAX_QUEUE:-512}
+      # No OLLAMA_NUM_GPU here: this is the CPU-only profile. If you add an
+      # NVIDIA GPU later, use the deploy.resources.reservations.devices
+      # block below instead of a GPU env var.
+    restart: unless-stopped
+    shm_size: "${OLLAMA_SHM_SIZE:-4gb}"
+    mem_limit: ${OLLAMA_MEM_LIMIT:-48g}
+    cpus: ${OLLAMA_CPUS:-12}
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    # Uncomment for NVIDIA GPU passthrough (requires NVIDIA Container Toolkit
+    # + WSL2 GPU support enabled in Docker Desktop):
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: 1
+    #           capabilities: [gpu]
+    labels:
+      # Ollama alone is safe to auto-update: no persistent settings.json
+      # migration concerns like agent-zero has.
+      - "com.centurylinklabs.watchtower.enable=true"
+      - "com.centurylinklabs.watchtower.scope=agent-zero"
+
+  agent-zero:
+    image: agent0ai/agent-zero:latest
+    container_name: agent-zero
+    depends_on:
+      ollama:
+        condition: service_healthy
+    environment:
+      - OLLAMA_BASE_URL=http://ollama:11434   # internal Docker network name, correct
+      - OLLAMA_CONTEXT_LENGTH=${OLLAMA_CONTEXT_LENGTH:-16384}
+      - OLLAMA_KEEP_ALIVE=${OLLAMA_KEEP_ALIVE:-24h}
+      - LITELLM_STREAM=False
+    ports:
+      - "${AGENT_ZERO_PORT:-8080}:80"
+    volumes:
+      # Only /a0/usr is mounted — mounting all of /a0 breaks in-app updates
+      # because it overwrites the application code that ships in the image.
+      - agent_zero_data:/a0/usr
+    restart: unless-stopped
+    shm_size: "${AGENT_ZERO_SHM_SIZE:-2gb}"
+    mem_limit: ${AGENT_ZERO_MEM_LIMIT:-12g}
+    cpus: ${AGENT_ZERO_CPUS:-4}
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:80/"]
+      interval: 20s
+      timeout: 10s
+      retries: 5
+      start_period: 45s
+    # NOTE: no watchtower label on purpose. Agent Zero has shipped major
+    # version jumps (e.g. v1.x -> v2.0) that are NOT drop-in upgrades — they
+    # need an explicit Settings -> Backup & Restore step first. Update
+    # manually instead:
+    #   docker compose pull agent-zero && docker compose up -d agent-zero
+
+  portainer:
+    image: portainer/portainer-ce:latest
+    container_name: portainer
+    ports:
+      - "9000:9000"
+      - "9443:9443"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - portainer_data:/data
+    restart: unless-stopped
+    mem_limit: 512m
+    # No watchtower label to avoid self-update issues
+
+  watchtower:
+    image: containrrr/watchtower:latest
+    container_name: watchtower
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      - WATCHTOWER_POLL_INTERVAL=${WATCHTOWER_POLL_INTERVAL:-3600}
+      - WATCHTOWER_LABEL_ENABLE=true
+      - WATCHTOWER_CLEANUP=true
+      - WATCHTOWER_INCLUDE_STOPPED=false
+      - WATCHTOWER_SCOPE=agent-zero
+    restart: unless-stopped
+    mem_limit: 256m
+    command: --interval ${WATCHTOWER_POLL_INTERVAL:-3600} --label-enable --cleanup --scope agent-zero
+
+volumes:
+  ollama_data:
+  agent_zero_data:
+  portainer_data:

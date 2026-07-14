@@ -1,0 +1,4 @@
+Agent Zero + Ollama — Advanced Docker Compose Setup 
+===================================================
+Version: ver-0.1r2m5
+Pushed to GitHub: 2026-07-15 00:58:51 IDT
